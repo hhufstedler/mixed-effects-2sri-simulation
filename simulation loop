@@ -1,0 +1,314 @@
+# ---------- Setup ----------
+results_folder <- "name_of_folder"
+if (!dir.exists(results_folder)) dir.create(results_folder)
+
+# Progress settings
+progress_every <- 10                                # print every 10 seeds in console
+progress_log   <- file.path(results_folder, "progress.log")
+
+# ADEMP guidelines: seed once; log RNG state per repetition
+set.seed(12345)
+rng_path <- file.path(results_folder, "rng_states.rds")
+rng_log  <- if (file.exists(rng_path)) readRDS(rng_path) else list()
+
+# Minimal per-rep table (Estimates dataset) with CIs & coverage
+metadata_path <- file.path(results_folder, "metadata.csv")
+if (!file.exists(metadata_path)) {
+  write.table(
+    data.frame(
+      seed_idx = integer(), batch_id = integer(),
+      pattern = character(), iv_strength = numeric(), confounding = character(),
+
+      estimate_2sri = numeric(), se_2sri = numeric(),
+      p_value_2sri = numeric(),
+
+      estimate_naive = numeric(), se_naive = numeric(),
+      p_value_naive = numeric(),
+
+      wald_stat = numeric(), p_value_wald = numeric(),
+      first_stage_warnings = logical(),
+      convergence_success = logical(),
+      runtime_sec = numeric(),
+      success = logical(), error_msg = character()
+    ),
+    file = metadata_path, sep = ",", row.names = FALSE, col.names = TRUE, append = FALSE
+  )
+}
+completed_df <- tryCatch(read.csv(metadata_path), error = function(e) NULL)
+
+
+# ---------- Fixed parameters ----------
+FIXED <- list(
+  n_studies = 10,
+  study_sizes = c(100, 148, 111, 738, 1096, 185, 1230, 214, 90, 445),
+  treatment_effect = -0.4,
+  beta_measurement_error = 0.1,
+  beta_age = 0.005,
+  beta_sex = 0.1,
+  meas_error_sd = 0.2
+)
+
+confounding_map <- list(
+  weak     = c(beta_U_treat = 0.5, beta_U_death = 0.5),
+  moderate = c(beta_U_treat = 1.0, beta_U_death = 1.0),
+  strong   = c(beta_U_treat = 1.5, beta_U_death = 1.5),
+  vstrong  = c(beta_U_treat = 2.0, beta_U_death = 2.0)
+)
+
+# ---------- Grid ----------
+param_tracker <- expand.grid(
+  pattern = c("1", "2", "3"),
+  iv_strength = c(0.3, 0.5, 0.8, 1.0),
+  confounding = c("weak", "moderate", "strong", "vstrong"),
+  stringsAsFactors = FALSE
+)
+param_tracker$batch_id <- seq_len(nrow(param_tracker))
+
+seeds_per_batch <- 1000  
+
+# ---------- IV exposure patterns ----------
+get_pattern_probs <- function(pattern, n_studies) {
+  switch(pattern,
+         "1"  = rep(0.5, n_studies),
+         "2" = c(rep(0.7, 5), rep(0.3, 5)),
+         "3"  = c(0.76, 0.97, 0.98, 0.05, 0.77, 0.05, 0.52, 0.10, 0.29, 0.15),
+         rep(0.5, n_studies)
+  )
+}
+# ---------- Single repetition ----------
+run_single_rep <- function(seed_idx, params, fixed_params) {
+  start_time <- Sys.time()
+  tryCatch({
+    # RNG state advances naturally per ADEMP guidelines
+
+    # Unpack
+    pattern <- params$pattern
+    iv_strength <- params$iv_strength
+    conf <- params$confounding
+    beta_U_treat <- confounding_map[[conf]]["beta_U_treat"]
+    beta_U_death <- confounding_map[[conf]]["beta_U_death"]
+    study_sizes <- fixed_params$study_sizes
+    n_studies <- fixed_params$n_studies
+    n_patients <- sum(study_sizes)
+
+    # Dates & ranges
+    admission_start <- ymd("2025-01-01"); admission_end <- ymd("2025-12-30")
+    min_age <- 18; max_age <- 80
+
+    # Study effects
+    study_ids <- seq_len(n_studies)
+    study_effect_treatment <- runif(n_studies, -0.1, 0.1)
+    study_effect_survival  <- runif(n_studies, -0.2, 0.2)
+    study <- rep(study_ids, times = study_sizes)
+
+    # Generate dataset
+    df <- data.frame(
+      id = seq_len(n_patients),
+      study = study,
+      age = sample(min_age:max_age, n_patients, replace = TRUE),
+      sex = sample(c("Male", "Female"), n_patients, replace = TRUE),
+      iv = rbinom(n_patients, 1, prob = get_pattern_probs(pattern, n_studies)[study]),
+      U = rnorm(n_patients, mean = 0, sd = 0.5),
+      admission_date = sample(seq(admission_start, admission_end, by = "day"), n_patients, replace = TRUE),
+      measurement_error = rnorm(n_patients, mean = 0, sd = fixed_params$meas_error_sd)
+    ) %>%
+      mutate(admission_month = floor_date(admission_date, "month"))
+
+    # Month effects
+    month_noise <- data.frame(
+      admission_month = seq(ymd("2025-01-01"), ymd("2025-12-01"), by = "1 month"),
+      month_effect_treatment = rnorm(12, mean = 0, sd = 0.15),
+      month_effect_survival  = rnorm(12, mean = 0, sd = 0.15)
+    )
+
+    # Join & generate treated/outcomes
+    df <- df %>%
+      left_join(month_noise, by = "admission_month") %>%
+      mutate(
+        study_effect_treatment = study_effect_treatment[study],
+        study_effect_survival  = study_effect_survival[study],
+
+        log_odds_treatment = -0.2 +
+          iv_strength * iv +
+          study_effect_treatment + month_effect_treatment +
+          beta_U_treat * U +
+          fixed_params$beta_measurement_error * measurement_error,
+        p_treat = plogis(log_odds_treatment),
+        treated = rbinom(n(), 1, prob = p_treat),
+
+        log_hazard_death = -4.2 +
+          study_effect_survival + month_effect_survival +
+          fixed_params$treatment_effect * treated +
+          fixed_params$beta_age * age + fixed_params$beta_sex * (sex == "Male") +
+          beta_U_death * U,
+        log_hazard_discharge = -1.1 -
+          study_effect_survival - month_effect_survival -
+          fixed_params$treatment_effect * treated -
+          fixed_params$beta_age * age - fixed_params$beta_sex * (sex == "Male") -
+          beta_U_death * U,
+
+        hazard_death = exp(log_hazard_death),
+        hazard_discharge = exp(log_hazard_discharge),
+        time_to_death = rweibull(n(), shape = 1.2, scale = 0.45 / hazard_death),
+        time_to_discharge = rweibull(n(), shape = 6.0, scale = 3.0 / hazard_discharge),
+        observed_time = pmin(time_to_death, time_to_discharge),
+        event = as.integer(time_to_death <= time_to_discharge)
+      ) %>%
+      mutate(
+        study = factor(study),
+        admission_month = factor(admission_month)
+      )
+
+    # First stage (suppress console output, retain warning capture)
+    fs_fit <- suppressWarnings(
+      glmer(
+        treated ~ iv + age + sex + (1 | study) + (1 | admission_month),
+        family = binomial(),
+        data = df,
+        control = glmerControl(check.conv.singular = "ignore")  # silence singular messages
+      )
+    )
+
+    z_iv <- summary(fs_fit)$coefficients["iv", "z value"]
+    wald_stat <- as.numeric(z_iv)^2
+    p_value_wald <- 1 - pchisq(wald_stat, df = 1)
+
+    df$residual_treatment <- residuals(fs_fit, type = "response")
+
+    # Capture whether there were boundary/convergence issues
+    msgs <- tryCatch(fs_fit@optinfo$conv$lme4$messages, error = function(e) NULL)
+    first_stage_warnings <- !is.null(msgs) && any(grepl("boundary|singular|convergence", msgs, ignore.case = TRUE))
+
+    # Second stage
+    m_2sri <- coxme(Surv(observed_time, event) ~ treated + residual_treatment +
+                      age + sex + (1 | study) + (1 | admission_month), data = df)
+    m_naive <- coxme(Surv(observed_time, event) ~ treated +
+                       age + sex + (1 | study) + (1 | admission_month), data = df)
+
+    est_2sri <- fixef(m_2sri)["treated"]
+    se_2sri  <- sqrt(diag(vcov(m_2sri)))["treated"]
+    z_2sri   <- as.numeric(est_2sri / se_2sri)
+    p_value_2sri <- 2 * (1 - pnorm(abs(z_2sri)))
+
+    est_naive <- fixef(m_naive)["treated"]
+    se_naive  <- sqrt(diag(vcov(m_naive)))["treated"]
+    z_naive   <- as.numeric(est_naive / se_naive)
+    p_value_naive <- 2 * (1 - pnorm(abs(z_naive)))
+
+    list(
+      success = TRUE, seed_idx = seed_idx, params = params,
+      metrics = list(
+        estimate_2sri = est_2sri, se_2sri = se_2sri, p_value_2sri = p_value_2sri,
+        estimate_naive = est_naive, se_naive = se_naive, p_value_naive = p_value_naive,
+        wald_stat = wald_stat, p_value_wald = p_value_wald,
+        first_stage_warnings = first_stage_warnings,
+        convergence_success = TRUE,
+        runtime_sec = as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+      )
+    )
+
+  }, error = function(e) {
+    list(
+      success = FALSE, seed_idx = seed_idx, params = params,
+      metrics = list(), error_msg = as.character(e$message)
+    )
+  })
+}
+
+# row writer 
+log_row <- function(result, filepath = metadata_path) {
+  if (result$success) {
+    m <- result$metrics
+    row <- data.frame(
+      seed_idx = result$seed_idx,
+      batch_id = result$params$batch_id,
+      pattern = result$params$pattern,
+      iv_strength = result$params$iv_strength,
+      confounding = result$params$confounding,
+
+      estimate_2sri = m$estimate_2sri, se_2sri = m$se_2sri, p_value_2sri = m$p_value_2sri,
+      estimate_naive = m$estimate_naive, se_naive = m$se_naive, p_value_naive = m$p_value_naive,
+
+      wald_stat = m$wald_stat, p_value_wald = m$p_value_wald,
+
+      first_stage_warnings = m$first_stage_warnings,
+      convergence_success = m$convergence_success,
+      runtime_sec = m$runtime_sec,
+      success = TRUE, error_msg = NA_character_
+    )
+  } else {
+    row <- data.frame(
+      seed_idx = result$seed_idx,
+      batch_id = result$params$batch_id,
+      pattern = result$params$pattern,
+      iv_strength = result$params$iv_strength,
+      confounding = result$params$confounding,
+
+      estimate_2sri = NA, se_2sri = NA, p_value_2sri = NA,
+      estimate_naive = NA, se_naive = NA, p_value_naive = NA,
+
+      wald_stat = NA, p_value_wald = NA,
+
+      first_stage_warnings = NA,
+      convergence_success = FALSE,
+      runtime_sec = NA,
+      success = FALSE, error_msg = result$error_msg
+    )
+  }
+  write.table(row, file = filepath, append = TRUE,
+              sep = ",", row.names = FALSE, col.names = FALSE)
+  invisible(row)
+}
+
+# ---------- Serial ADEMP loop ----------
+n_batches <- nrow(param_tracker)
+
+for (i in seq_len(n_batches)) {
+  current_params <- param_tracker[i, ]
+
+  # -------- PROGRESS: batch header --------
+  batch_header <- sprintf(
+    "Batch %d/%d | pattern=%s | iv_strength=%.2f | confounding=%s",
+    i, n_batches, current_params$pattern, current_params$iv_strength, current_params$confounding
+  )
+  cat(batch_header, "\n")
+  write(batch_header, file = progress_log, append = TRUE)
+
+  for (seed_idx in seq_len(seeds_per_batch)) {
+
+    # Resume-safe skip
+    if (!is.null(completed_df) &&
+        any(completed_df$batch_id == current_params$batch_id &
+            completed_df$seed_idx == seed_idx)) next
+
+    # Store RNG state for reproducibility
+    rng_log[[length(rng_log) + 1]] <- .Random.seed
+
+    # Run one repetition
+    result <- run_single_rep(seed_idx = seed_idx, params = current_params, fixed_params = FIXED)
+
+    # Write one row immediately
+    log_row(result, filepath = metadata_path)
+
+    # -------- PROGRESS: seed tick --------
+    if ((seed_idx %% progress_every) == 0L) {
+      tick <- sprintf("  ...seed %d/%d done", seed_idx, seeds_per_batch)
+      cat(tick, "\n")
+      write(tick, file = progress_log, append = TRUE)
+    }
+
+    # Checkpoint periodically
+    if ((seed_idx %% progress_every) == 0L) {
+      saveRDS(rng_log, rng_path)
+      gc(FALSE)
+      completed_df <- tryCatch(read.csv(metadata_path), error = function(e) NULL)
+    }
+  }
+}
+
+# Store final RNG state
+rng_log[[length(rng_log) + 1]] <- .Random.seed
+saveRDS(rng_log, rng_path)
+
+cat("All batches complete.\n")
+write("All batches complete.", file = progress_log, append = TRUE)
