@@ -1,0 +1,21 @@
+# Mixed-Effects Two-Stage Residual Inclusion Simulation
+
+Simulation code for "Mixed-Effects Two-Stage Residual Inclusion Methods for Individual Patient Data Meta-Analysis: A Methodological Framework for Causal Inference in Survival Analysis"
+
+## Description
+
+This R script implements a Monte Carlo simulation study evaluating mixed-effects 2SRI against naive Cox regression across 48 scenarios varying:
+- Unmeasured confounding (weak, moderate, strong, very strong)
+- Instrument-treatment association (0.3, 0.5, 0.8, 1.0)
+- IV allocation patterns (3 patterns)
+
+Each scenario runs 1,000 replications (N=48,000 total simulations).
+
+## Requirements
+
+- R 4.0+
+- Required packages: `lme4`, `coxme`, `survival`, `dplyr`, `lubridate`
+
+## Usage
+
+Set `results_folder` name and run the entire script. Results are written incrementally to `metadata.csv`.
